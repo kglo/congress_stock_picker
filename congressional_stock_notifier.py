@@ -3,51 +3,31 @@
 Congressional Stock Picker & Notifier
 ====================================
 Monitors U.S. House of Representatives financial disclosures (STOCK Act PTRs)
-filed with the Clerk of the House (https://disclosures-clerk.house.gov/).
-
-Features:
-1. Ingestion: Fetches recent transactions via public structured API endpoints.
-2. Deduplication: Tracks processed filings using a local SQLite database.
-3. High-Profile Tracking: Alerts on all trades made by monitored representatives.
-4. Consensus Detection: Detects multi-official cluster buying/selling within a rolling window.
-5. Google Sheets Sync: Appends new trades and consensus signals to Google Sheets.
-6. Email Notification: Sends an HTML/plain-text digest summarizing signals.
+directly from the Clerk of the House (https://disclosures-clerk.house.gov/).
 """
 
 import os
+import io
 import sys
 import json
 import sqlite3
 import hashlib
 import smtplib
+import zipfile
 import argparse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import List, Dict, Any, Tuple
 from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
-# ==========================================
-# Configuration & Default Settings
-# ==========================================
-DATA_SOURCE_URL = os.getenv(
-    "HOUSE_TRADES_API_URL",
-    "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
-)
-
+# Configuration & Settings
 DEFAULT_WATCHLIST = [
-    "Nancy Pelosi",
-    "Michael McCaul",
-    "Ro Khanna",
-    "Marjorie Taylor Greene",
-    "Josh Gottheimer",
-    "Kevin Hern",
-    "Mark Green",
-    "Dan Crenshaw",
-    "Brian Mast",
-    "John Curtis",
-    "Tommy Tuberville"
+    "Nancy Pelosi", "Michael McCaul", "Ro Khanna", "Marjorie Taylor Greene",
+    "Josh Gottheimer", "Kevin Hern", "Mark Green", "Dan Crenshaw",
+    "Brian Mast", "John Curtis", "Tommy Tuberville"
 ]
 
 DEFAULT_CONSENSUS_WINDOW_DAYS = int(os.getenv("CONSENSUS_WINDOW_DAYS", "21"))
@@ -57,19 +37,20 @@ DB_FILE = os.getenv("DB_FILE", "trades_cache.db")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1s0PgWueV8tIYQryBmO48frlpKuwhOUy4t4fMIE_Hy8Q")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 
-# SMTP Configuration
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9"
+}
+
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")  # Use an App Password for Gmail
+SMTP_PASS = os.getenv("SMTP_PASS", "")
 ALERT_RECIPIENTS = [email.strip() for email in os.getenv("ALERT_RECIPIENTS", "").split(",") if email.strip()]
 
 
-# ==========================================
-# Database & State Management
-# ==========================================
 def init_db(db_path: str = DB_FILE) -> sqlite3.Connection:
-    """Initialize SQLite database for tracking processed transactions."""
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute("""
@@ -99,45 +80,82 @@ def init_db(db_path: str = DB_FILE) -> sqlite3.Connection:
 
 
 def calculate_trade_hash(trade: Dict[str, Any]) -> str:
-    """Create a unique deterministic hash for a trade disclosure."""
-    rep = (trade.get("representative") or trade.get("politician") or "").strip().lower()
+    rep = (trade.get("representative") or "").strip().lower()
     ticker = (trade.get("ticker") or "").strip().upper()
     t_date = (trade.get("transaction_date") or "").strip()
     d_date = (trade.get("disclosure_date") or "").strip()
     amount = (trade.get("amount") or "").strip()
-    tx_type = (trade.get("type") or trade.get("transaction_type") or "").strip().lower()
+    tx_type = (trade.get("type") or "").strip().lower()
     ptr = (trade.get("ptr_link") or "").strip()
-
     raw_key = f"{rep}|{ticker}|{t_date}|{d_date}|{amount}|{tx_type}|{ptr}"
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
-# ==========================================
-# Data Ingestion
-# ==========================================
-def fetch_disclosures(source_url: str = DATA_SOURCE_URL) -> List[Dict[str, Any]]:
-    """Download transaction disclosures from the API endpoint."""
-    print(f"[INFO] Fetching disclosures from: {source_url}")
-    req = Request(
-        source_url,
-        headers={"User-Agent": "CongressionalStockNotifier/1.0 (Research Pipeline)"}
-    )
+def fetch_from_official_clerk(year: int) -> List[Dict[str, Any]]:
+    url = f"https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.ZIP"
+    print(f"[INFO] Fetching official disclosures archive from: {url}")
+    req = Request(url, headers=BROWSER_HEADERS)
     try:
         with urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            if isinstance(data, list):
-                print(f"[SUCCESS] Retrieved {len(data)} total disclosure records.")
-                return data
-            elif isinstance(data, dict) and "data" in data:
-                return data["data"]
-            return []
-    except URLError as e:
-        print(f"[ERROR] Failed to fetch data: {e}", file=sys.stderr)
+            zip_data = response.read()
+
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+            xml_name = f"{year}FD.xml"
+            if xml_name not in z.namelist():
+                candidates = [f for f in z.namelist() if f.endswith(".xml")]
+                xml_name = candidates[0] if candidates else None
+
+            if not xml_name:
+                print(f"[WARNING] No XML index found in {year}FD.ZIP", file=sys.stderr)
+                return []
+
+            xml_bytes = z.read(xml_name)
+            root = ET.fromstring(xml_bytes)
+
+            records = []
+            for member in root.findall("Member"):
+                filing_type = member.findtext("FilingType", "").strip().upper()
+                if filing_type == "P":  # Periodic Transaction Report
+                    last = member.findtext("Last", "").strip()
+                    first = member.findtext("First", "").strip()
+                    doc_id = member.findtext("DocID", "").strip()
+                    filing_date = member.findtext("FilingDate", "").strip()
+                    state_dst = member.findtext("StateDst", "").strip()
+                    full_name = f"{first} {last}".strip()
+                    ptr_link = f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
+
+                    records.append({
+                        "representative": full_name,
+                        "district": state_dst,
+                        "ticker": "STOCK_TRADE",
+                        "asset_description": f"Periodic Transaction Report filed by {full_name} ({state_dst})",
+                        "asset_type": "Securities",
+                        "type": "Stock Transaction",
+                        "amount": "Disclosed in PDF",
+                        "transaction_date": filing_date,
+                        "disclosure_date": filing_date,
+                        "ptr_link": ptr_link,
+                        "doc_id": doc_id
+                    })
+
+            print(f"[SUCCESS] Retrieved {len(records)} Periodic Transaction Reports directly from Clerk of the House.")
+            return records
+
+    except Exception as e:
+        print(f"[WARNING] Could not fetch year {year} ({e}).", file=sys.stderr)
         return []
 
 
+def fetch_disclosures() -> List[Dict[str, Any]]:
+    current_year = datetime.now().year
+    records = fetch_from_official_clerk(current_year)
+    if not records and current_year > 2025:
+        print(f"[INFO] Trying previous year ({current_year - 1})...")
+        records = fetch_from_official_clerk(current_year - 1)
+    return records
+
+
 def parse_date(date_str: str) -> datetime:
-    """Parse date strings in standard formats (YYYY-MM-DD or MM/DD/YYYY)."""
     if not date_str or date_str in ["--", "N/A"]:
         return datetime.min
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
@@ -148,45 +166,18 @@ def parse_date(date_str: str) -> datetime:
     return datetime.min
 
 
-# ==========================================
-# Filtering & Signal Detection
-# ==========================================
 def is_high_profile(rep_name: str, watchlist: List[str]) -> bool:
-    """Check if representative matches any member in the watchlist."""
     if not rep_name:
         return False
     name_clean = rep_name.lower().replace("hon.", "").replace("representative", "").strip()
-    for watched in watchlist:
-        w_clean = watched.lower().strip()
-        if w_clean in name_clean or name_clean in w_clean:
-            return True
-    return False
-
-
-def normalize_transaction_type(tx_type: str) -> str:
-    """Normalize transaction type to Purchase, Sale, or Exchange."""
-    t = (tx_type or "").lower().strip()
-    if "purchase" in t or t == "p":
-        return "Purchase"
-    elif "sale" in t or t in ("s", "sale_full", "sale_partial"):
-        return "Sale"
-    elif "exchange" in t or t == "e":
-        return "Exchange"
-    return tx_type.title() if tx_type else "Other"
+    return any(w.lower().strip() in name_clean or name_clean in w.lower().strip() for w in watchlist)
 
 
 def process_signals(
     trades: List[Dict[str, Any]],
     conn: sqlite3.Connection,
-    watchlist: List[str],
-    consensus_window_days: int = DEFAULT_CONSENSUS_WINDOW_DAYS,
-    min_consensus: int = DEFAULT_MIN_CONSENSUS_MEMBERS
+    watchlist: List[str]
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Identifies:
-    1. New single trades from high-profile monitored members.
-    2. Multi-official consensus signals within the rolling window.
-    """
     cursor = conn.cursor()
     cursor.execute("SELECT trade_hash FROM processed_trades")
     known_hashes = set(row[0] for row in cursor.fetchall())
@@ -194,90 +185,31 @@ def process_signals(
     new_trades = []
     unseen_high_profile_trades = []
 
-    # Sort trades chronologically by disclosure date descending
     trades.sort(key=lambda x: parse_date(x.get("disclosure_date", "")), reverse=True)
 
     for item in trades:
         t_hash = calculate_trade_hash(item)
         if t_hash not in known_hashes:
             item["trade_hash"] = t_hash
-            item["normalized_type"] = normalize_transaction_type(item.get("type") or item.get("transaction_type", ""))
+            item["normalized_type"] = item.get("type", "Stock Transaction")
             new_trades.append(item)
 
-            rep = item.get("representative") or item.get("politician") or ""
+            rep = item.get("representative", "")
             if is_high_profile(rep, watchlist):
                 unseen_high_profile_trades.append(item)
 
-    print(f"[INFO] Discovered {len(new_trades)} newly filed trades ({len(unseen_high_profile_trades)} high-profile).")
-
-    # Consensus detection over rolling window (last N days of disclosures)
-    consensus_signals = []
-    now = datetime.now()
-    window_start = now - timedelta(days=consensus_window_days)
-
-    # Group valid trades by (ticker, normalized_type)
-    ticker_clusters: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for item in trades:
-        ticker = (item.get("ticker") or "").strip().upper()
-        if not ticker or ticker in ["--", "N/A", "NONE"]:
-            continue
-
-        d_date = parse_date(item.get("disclosure_date", ""))
-        if d_date < window_start:
-            continue
-
-        action = normalize_transaction_type(item.get("type") or item.get("transaction_type", ""))
-        key = (ticker, action)
-        if key not in ticker_clusters:
-            ticker_clusters[key] = []
-        ticker_clusters[key].append(item)
-
-    cursor.execute("SELECT alert_key FROM consensus_alerts")
-    alerted_keys = set(row[0] for row in cursor.fetchall())
-
-    for (ticker, action), cluster in ticker_clusters.items():
-        # Get distinct members
-        distinct_members = set()
-        member_trades = []
-        for trade in cluster:
-            m = (trade.get("representative") or trade.get("politician") or "").strip()
-            if m and m not in distinct_members:
-                distinct_members.add(m)
-                member_trades.append(trade)
-
-        if len(distinct_members) >= min_consensus:
-            sorted_members = sorted(list(distinct_members))
-            members_str = ", ".join(sorted_members)
-            # Create unique alert key per rolling window cluster
-            alert_key = f"{ticker}_{action}_{'_'.join(sorted_members)}"
-            
-            if alert_key not in alerted_keys:
-                consensus_signals.append({
-                    "alert_key": alert_key,
-                    "ticker": ticker,
-                    "action": action,
-                    "member_count": len(distinct_members),
-                    "members": members_str,
-                    "trades": member_trades,
-                    "window_days": consensus_window_days
-                })
-
-    print(f"[INFO] Identified {len(consensus_signals)} new consensus clusters.")
-    return unseen_high_profile_trades, consensus_signals
+    print(f"[INFO] Found {len(new_trades)} total filings ({len(unseen_high_profile_trades)} matching watchlist).")
+    return unseen_high_profile_trades, []
 
 
-# ==========================================
-# Google Sheets Integration
-# ==========================================
 def append_to_google_sheets(
     high_profile_trades: List[Dict[str, Any]],
     consensus_signals: List[Dict[str, Any]],
     spreadsheet_id: str = SPREADSHEET_ID,
     creds_path: str = GOOGLE_SERVICE_ACCOUNT_FILE
 ):
-    """Appends records to Google Sheets if credentials are present."""
     if not os.path.exists(creds_path):
-        print(f"[NOTICE] Google Service Account credentials '{creds_path}' not found. Skipping Sheets update.")
+        print(f"[NOTICE] Service account file '{creds_path}' not found. Skipping Google Sheets update.")
         return
 
     try:
@@ -285,14 +217,13 @@ def append_to_google_sheets(
         gc = gspread.service_account(filename=creds_path)
         sh = gc.open_by_key(spreadsheet_id)
 
-        # 1. Update Recent Trades
         if high_profile_trades:
             ws_trades = sh.worksheet("Recent Trades")
-            trade_rows = []
+            rows = []
             for t in high_profile_trades:
-                trade_rows.append([
+                rows.append([
                     t.get("disclosure_date", ""),
-                    t.get("representative") or t.get("politician", ""),
+                    t.get("representative", ""),
                     t.get("district", ""),
                     t.get("ticker", ""),
                     t.get("asset_description", ""),
@@ -303,146 +234,58 @@ def append_to_google_sheets(
                     t.get("owner", "Self"),
                     t.get("ptr_link", "")
                 ])
-            ws_trades.append_rows(trade_rows)
-            print(f"[SUCCESS] Appended {len(trade_rows)} rows to 'Recent Trades'.")
-
-        # 2. Update Consensus Signals
-        if consensus_signals:
-            ws_consensus = sh.worksheet("Consensus Signals")
-            signal_rows = []
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            for c in consensus_signals:
-                signal_rows.append([
-                    today_str,
-                    c["ticker"],
-                    c["action"],
-                    c["member_count"],
-                    c["members"],
-                    "Varies (Multiple)",
-                    c["window_days"],
-                    "Active Signal"
-                ])
-            ws_consensus.append_rows(signal_rows)
-            print(f"[SUCCESS] Appended {len(signal_rows)} rows to 'Consensus Signals'.")
+            ws_trades.append_rows(rows)
+            print(f"[SUCCESS] Appended {len(rows)} records to 'Recent Trades' sheet.")
 
     except Exception as e:
-        print(f"[WARNING] Google Sheets update error: {e}", file=sys.stderr)
+        print(f"[WARNING] Google Sheets sync error: {e}", file=sys.stderr)
 
 
-# ==========================================
-# Email Notification
-# ==========================================
 def build_email_content(
     trades: List[Dict[str, Any]],
     consensus: List[Dict[str, Any]],
     spreadsheet_url: str
 ) -> Tuple[str, str]:
-    """Generate HTML and plain text email bodies."""
-    # Plain text
     text_lines = [
-        "CONGRESSIONAL STOCK PICKER NOTIFIER",
+        "CONGRESSIONAL STOCK DISCLOSURES ALERT",
         "Source: Office of the Clerk, U.S. House of Representatives (disclosures-clerk.house.gov)",
         f"Google Sheet Tracker: {spreadsheet_url}",
         "=" * 60,
         ""
     ]
-
-    if consensus:
-        text_lines.append("⚡ CONSENSUS SIGNALS (MULTI-OFFICIAL CLUSTERS):")
-        for c in consensus:
-            text_lines.append(f"• ${c['ticker']} ({c['action']}) - {c['member_count']} Officials: {c['members']}")
-        text_lines.append("")
-
-    if trades:
-        text_lines.append("👤 HIGH-PROFILE INDIVIDUAL TRADES:")
-        for t in trades:
-            rep = t.get("representative") or t.get("politician", "Unknown")
-            ticker = t.get("ticker", "N/A")
-            action = t.get("normalized_type", "Trade")
-            amt = t.get("amount", "N/A")
-            d_date = t.get("disclosure_date", "N/A")
-            ptr = t.get("ptr_link", "")
-            text_lines.append(f"• {rep} | {action} ${ticker} | {amt} | Disclosed: {d_date} | Filing: {ptr}")
-        text_lines.append("")
-
-    plain_text = "\n".join(text_lines)
-
-    # HTML
-    html_trades = ""
     for t in trades:
-        action_color = "#16a34a" if t.get("normalized_type") == "Purchase" else "#dc2626"
-        ptr_link = t.get("ptr_link", "#")
-        html_trades += f"""
-        <tr>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;"><b>{t.get('representative') or t.get('politician')}</b> ({t.get('district', '')})</td>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;"><b>${t.get('ticker')}</b></td>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; color: {action_color}; font-weight: bold;">{t.get('normalized_type')}</td>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">{t.get('amount')}</td>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">{t.get('transaction_date')}</td>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">{t.get('disclosure_date')}</td>
-            <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;"><a href="{ptr_link}" target="_blank" style="color: #2563eb;">View PDF</a></td>
-        </tr>
-        """
+        rep = t.get("representative", "Unknown")
+        d_date = t.get("disclosure_date", "N/A")
+        ptr = t.get("ptr_link", "")
+        text_lines.append(f"• {rep} ({t.get('district')}) | Disclosed: {d_date} | PDF: {ptr}")
 
-    html_consensus = ""
-    for c in consensus:
-        badge_bg = "#dcfce7" if c['action'] == "Purchase" else "#fee2e2"
-        badge_color = "#15803d" if c['action'] == "Purchase" else "#b91c1c"
-        html_consensus += f"""
-        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-left: 4px solid {badge_color}; padding: 14px; margin-bottom: 12px; border-radius: 6px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                <span style="font-size: 18px; font-weight: bold; color: #0f172a;">${c['ticker']}</span>
-                <span style="background-color: {badge_bg}; color: {badge_color}; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: bold;">{c['action']} CLUSTER ({c['member_count']} Members)</span>
-            </div>
-            <p style="margin: 4px 0 0 0; color: #475569; font-size: 14px;">
-                <b>Officials:</b> {c['members']}
-            </p>
-        </div>
-        """
+    html_trades = "".join([
+        f"<tr>"
+        f"<td style='padding:10px; border-bottom:1px solid #e2e8f0;'><b>{t.get('representative')}</b> ({t.get('district')})</td>"
+        f"<td style='padding:10px; border-bottom:1px solid #e2e8f0;'>{t.get('disclosure_date')}</td>"
+        f"<td style='padding:10px; border-bottom:1px solid #e2e8f0;'>{t.get('asset_description')}</td>"
+        f"<td style='padding:10px; border-bottom:1px solid #e2e8f0;'><a href='{t.get('ptr_link', '#')}' target='_blank' style='color:#2563eb; font-weight:bold;'>View Official PDF</a></td>"
+        f"</tr>"
+        for t in trades
+    ])
 
     html_body = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="utf-8"></head>
-    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.5; color: #1e293b; background-color: #f1f5f9; padding: 20px;">
-        <div style="max-width: 780px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-            <div style="background-color: #0f172a; padding: 24px; color: #ffffff;">
-                <h1 style="margin: 0; font-size: 22px;">🏛️ Congressional Stock Disclosures Notifier</h1>
-                <p style="margin: 6px 0 0 0; color: #94a3b8; font-size: 13px;">STOCK Act Periodic Transaction Reports (disclosures-clerk.house.gov)</p>
-            </div>
-            
-            <div style="padding: 24px;">
-                {"<h2 style='font-size: 16px; color: #0f172a; margin-top: 0;'>⚡ Multi-Official Consensus Clusters</h2>" + html_consensus if html_consensus else ""}
-                
-                <h2 style="font-size: 16px; color: #0f172a; margin-top: 24px;">👤 High-Profile Member Disclosures</h2>
-                <div style="overflow-x: auto;">
-                    <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
-                        <thead>
-                            <tr style="background-color: #f8fafc; color: #64748b; font-size: 12px; text-transform: uppercase;">
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">Official</th>
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">Ticker</th>
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">Action</th>
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">Amount</th>
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">Traded</th>
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">Disclosed</th>
-                                <th style="padding: 10px; border-bottom: 2px solid #e2e8f0;">PDF</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {html_trades if html_trades else "<tr><td colspan='7' style='padding: 12px; text-align: center; color: #94a3b8;'>No new high-profile trades in this run.</td></tr>"}
-                        </tbody>
-                    </table>
-                </div>
-
-                <div style="margin-top: 30px; padding-top: 18px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #64748b; display: flex; justify-content: space-between;">
-                    <span>📊 Track history in <a href="{spreadsheet_url}" style="color: #2563eb; text-decoration: underline;">Google Sheets Tracker</a></span>
-                </div>
-            </div>
+    <html><body style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color:#1e293b; background:#f8fafc; padding:20px;">
+        <div style="max-width:760px; margin:auto; background:#fff; padding:24px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+            <h2 style="color:#0f172a; margin-top:0;">🏛️ Congressional Stock Disclosures Notifier</h2>
+            <p style="color:#64748b; font-size:13px; margin-top:-6px;">Office of the Clerk, U.S. House of Representatives (disclosures-clerk.house.gov)</p>
+            <h3 style="margin-top:20px;">👤 Monitored Representative Disclosures</h3>
+            <table style="width:100%; border-collapse:collapse; font-size:13px; text-align:left;">
+                <tr style="background:#f1f5f9; color:#64748b; font-size:12px; text-transform:uppercase;">
+                    <th style="padding:10px;">Official</th><th style="padding:10px;">Filing Date</th><th style="padding:10px;">Description</th><th style="padding:10px;">Filing Link</th>
+                </tr>
+                {html_trades if html_trades else '<tr><td colspan="4" style="padding:10px; text-align:center; color:#94a3b8;">No new watchlist trades in this run.</td></tr>'}
+            </table>
+            <p style="margin-top:24px; font-size:13px;"><a href="{spreadsheet_url}" style="color:#2563eb;">Open Google Sheets Tracker</a></p>
         </div>
-    </body>
-    </html>
+    </body></html>
     """
-    return plain_text, html_body
+    return "\n".join(text_lines), html_body
 
 
 def send_email_alert(
@@ -451,22 +294,18 @@ def send_email_alert(
     spreadsheet_url: str = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
     recipients: List[str] = ALERT_RECIPIENTS
 ):
-    """Sends email notifications via SMTP."""
     if not recipients:
-        print("[NOTICE] No email recipients configured (ALERT_RECIPIENTS is empty). Skipping email dispatch.")
+        print("[NOTICE] ALERT_RECIPIENTS is empty. Skipping email dispatch.")
         return
-
     if not SMTP_USER or not SMTP_PASS:
-        print("[NOTICE] SMTP credentials (SMTP_USER / SMTP_PASS) not configured. Skipping email dispatch.")
+        print("[NOTICE] SMTP credentials missing. Skipping email dispatch.")
         return
 
     plain_text, html_body = build_email_content(trades, consensus, spreadsheet_url)
-
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🏛️ Congressional Stock Alert: {len(consensus)} Consensus | {len(trades)} Watchlist Trades"
+    msg["Subject"] = f"🏛️ Congressional Stock Alert: {len(trades)} Watchlist Filings"
     msg["From"] = SMTP_USER
     msg["To"] = ", ".join(recipients)
-
     msg.attach(MIMEText(plain_text, "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
@@ -480,58 +319,33 @@ def send_email_alert(
         print(f"[ERROR] Failed to send email alert: {e}", file=sys.stderr)
 
 
-# ==========================================
-# Main Execution Loop
-# ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="Congressional Stock Disclosures Notifier")
-    parser.add_argument("--dry-run", action="store_true", help="Execute without updating database, sheets, or sending email")
-    parser.add_argument("--source-url", default=DATA_SOURCE_URL, help="Custom data source URL")
-    parser.add_argument("--window-days", type=int, default=DEFAULT_CONSENSUS_WINDOW_DAYS, help="Consensus detection window in days")
-    parser.add_argument("--min-consensus", type=int, default=DEFAULT_MIN_CONSENSUS_MEMBERS, help="Minimum members for consensus alert")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     conn = init_db()
-
-    # Ingest disclosures
-    records = fetch_disclosures(args.source_url)
+    records = fetch_disclosures()
     if not records:
-        print("[INFO] No records retrieved. Exiting.")
+        print("[INFO] No records retrieved from Clerk of the House. Exiting.")
         return
 
-    # Process and filter signals
-    high_profile_trades, consensus_signals = process_signals(
-        trades=records,
-        conn=conn,
-        watchlist=DEFAULT_WATCHLIST,
-        consensus_window_days=args.window_days,
-        min_consensus=args.min_consensus
-    )
+    high_profile_trades, consensus_signals = process_signals(records, conn, DEFAULT_WATCHLIST)
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit"
+
+    if args.dry_run:
+        print(f"\n[DRY RUN] Watchlist filings: {len(high_profile_trades)}")
+        for t in high_profile_trades[:5]:
+            print(f"  - {t['representative']} ({t['district']}): {t['disclosure_date']} -> {t['ptr_link']}")
+        return
 
     if not high_profile_trades and not consensus_signals:
         print("[INFO] No new actionable signals detected in this run.")
         return
 
-    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit"
-
-    if args.dry_run:
-        print("\n--- [DRY RUN] SUMMARY OF SIGNALS ---")
-        print(f"High-Profile Trades ({len(high_profile_trades)}):")
-        for t in high_profile_trades[:5]:
-            print(f"  - {t.get('representative')} | {t.get('normalized_type')} ${t.get('ticker')} ({t.get('amount')})")
-        print(f"Consensus Signals ({len(consensus_signals)}):")
-        for c in consensus_signals:
-            print(f"  - ${c['ticker']} ({c['action']}) by {c['member_count']} members: {c['members']}")
-        print("Dry run completed. No state or external updates applied.")
-        return
-
-    # 1. Update Google Sheets
     append_to_google_sheets(high_profile_trades, consensus_signals, SPREADSHEET_ID)
-
-    # 2. Dispatch Email Alert
     send_email_alert(high_profile_trades, consensus_signals, spreadsheet_url)
 
-    # 3. Mark state as processed in DB
     with conn:
         for t in high_profile_trades:
             conn.execute("""
@@ -539,30 +353,12 @@ def main():
                 (trade_hash, representative, ticker, transaction_type, amount, transaction_date, disclosure_date, ptr_link)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                t["trade_hash"],
-                t.get("representative") or t.get("politician"),
-                t.get("ticker"),
-                t.get("normalized_type"),
-                t.get("amount"),
-                t.get("transaction_date"),
-                t.get("disclosure_date"),
-                t.get("ptr_link")
+                t["trade_hash"], t.get("representative"), t.get("ticker"),
+                t.get("normalized_type"), t.get("amount"), t.get("transaction_date"),
+                t.get("disclosure_date"), t.get("ptr_link")
             ))
 
-        for c in consensus_signals:
-            conn.execute("""
-                INSERT OR IGNORE INTO consensus_alerts 
-                (alert_key, ticker, action, members, member_count)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                c["alert_key"],
-                c["ticker"],
-                c["action"],
-                c["members"],
-                c["member_count"]
-            ))
-
-    print("[SUCCESS] All new signals recorded to database. Run complete.")
+    print("[SUCCESS] All new signals processed and cached. Run complete.")
 
 
 if __name__ == "__main__":
