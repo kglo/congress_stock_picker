@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+trades_cache.db
+service_account.json
+.env
+notifier.log
